@@ -25,12 +25,13 @@ rescue # blanket rescue because there are naked raises
   false
 end
 
+# Note that this block is guarded with `if superenv?`
 class << ENV
   attr_accessor :keg_only_deps, :deps, :x11
   alias_method :x11?, :x11
 
   def reset
-    %w{CC CXX OBJC OBJCXX CPP MAKE LD
+    %w{CC CXX OBJC OBJCXX CPP MAKE LD LDSHARED
       CFLAGS CXXFLAGS OBJCFLAGS OBJCXXFLAGS LDFLAGS CPPFLAGS
       MACOS_DEPLOYMENT_TARGET SDKROOT
       CMAKE_PREFIX_PATH CMAKE_INCLUDE_PATH CMAKE_FRAMEWORK_PATH
@@ -47,7 +48,7 @@ class << ENV
     ENV['CXX'] = 'c++'
     ENV['OBJC'] = 'cc'
     ENV['OBJCXX'] = 'c++'
-    ENV['DEVELOPER_DIR'] = determine_developer_dir # effects later settings
+    ENV['DEVELOPER_DIR'] = determine_developer_dir
     ENV['MAKEFLAGS'] ||= "-j#{determine_make_jobs}"
     ENV['PATH'] = determine_path
     ENV['PKG_CONFIG_PATH'] = determine_pkg_config_path
@@ -56,15 +57,32 @@ class << ENV
     ENV['HOMEBREW_CCCFG'] = determine_cccfg
     ENV['HOMEBREW_BREW_FILE'] = HOMEBREW_BREW_FILE
     ENV['HOMEBREW_SDKROOT'] = "#{MacOS.sdk_path}" if MacSystem.xcode43_without_clt?
+    ENV['HOMEBREW_DEVELOPER_DIR'] = determine_developer_dir # used by our xcrun shim
     ENV['CMAKE_PREFIX_PATH'] = determine_cmake_prefix_path
-    ENV['CMAKE_FRAMEWORK_PATH'] = "#{MacOS.sdk_path}/System/Library/Frameworks" if MacSystem.xcode43_without_clt?
+    ENV['CMAKE_FRAMEWORK_PATH'] = determine_cmake_frameworks_path
     ENV['CMAKE_INCLUDE_PATH'] = determine_cmake_include_path
     ENV['CMAKE_LIBRARY_PATH'] = determine_cmake_library_path
     ENV['ACLOCAL_PATH'] = determine_aclocal_path
 
+    # The HOMEBREW_CCCFG ENV variable is used by the ENV/cc tool to control
+    # compiler flag stripping. It consists of a string of characters which act
+    # as flags. Some of these flags are mutually exclusive.
+    #
+    # u - A universal build was requested
+    # 3 - A 32-bit build was requested
+    # b - Installing from a bottle
+    # i - Installing from a bottle on Intel
+    # 6 - Installing from a bottle on 64-bit Intel
+    # O - Enables argument refurbishing. Only active under the
+    #     make/bsdmake wrappers currently.
+    #
+    # On 10.8 and newer, these flags will also be present:
+    # s - apply fix for sed's Unicode support
+    # a - apply fix for apr-1-config path
+
     # Homebrew's apple-gcc42 will be outside the PATH in superenv,
     # so xcrun may not be able to find it
-    if ENV['HOMEBREW_CC'] == 'gcc-4.2' && !MacOS.locate('gcc-4.2')
+    if ENV['HOMEBREW_CC'] == 'gcc-4.2'
       apple_gcc42 = Formula.factory('apple-gcc42') rescue nil
       ENV.append('PATH', apple_gcc42.opt_prefix/'bin', ':') if apple_gcc42
     end
@@ -74,7 +92,7 @@ class << ENV
     append 'HOMEBREW_CCCFG', "u", ''
   end
 
-  # m32 on superenv does not add any flags. It prevents "-m32" from being erased.
+  # m32 on superenv does not add any CC flags. It prevents "-m32" from being erased.
   def m32
     append 'HOMEBREW_CCCFG', "3", ''
   end
@@ -133,7 +151,6 @@ class << ENV
       paths << "#{MacOS::Xcode.prefix}/Toolchains/XcodeDefault.xctoolchain/usr/bin"
     end
     paths += deps.map{|dep| "#{HOMEBREW_PREFIX}/opt/#{dep}/bin" }
-    paths << "#{HOMEBREW_PREFIX}/opt/python/bin" if brewed_python?
     paths << "#{MacSystem.x11_prefix}/bin" if x11?
     paths += %w{/usr/bin /bin /usr/sbin /sbin}
     paths.to_path_s
@@ -158,6 +175,13 @@ class << ENV
     paths.to_path_s
   end
 
+  def determine_cmake_frameworks_path
+    # XXX: keg_only_deps perhaps? but Qt does not link its Frameworks because of Ruby's Find.find ignoring symlinks!!
+    paths = deps.map{|dep| "#{HOMEBREW_PREFIX}/opt/#{dep}/Frameworks" }
+    paths << "#{MacOS.sdk_path}/System/Library/Frameworks" if MacSystem.xcode43_without_clt?
+    paths.to_path_s
+  end
+
   def determine_cmake_include_path
     sdk = MacOS.sdk_path if MacSystem.xcode43_without_clt?
     paths = []
@@ -165,11 +189,6 @@ class << ENV
     paths << "#{sdk}/usr/include/libxml2" unless deps.include? 'libxml2'
     if MacSystem.xcode43_without_clt?
       paths << "#{sdk}/usr/include/apache2"
-      paths << if brewed_python?
-        "#{HOMEBREW_PREFIX}/opt/python/Frameworks/Python.framework/Headers"
-      else
-        "#{sdk}/System/Library/Frameworks/Python.framework/Versions/Current/include/python2.7"
-      end
     end
     paths << "#{sdk}/System/Library/Frameworks/OpenGL.framework/Versions/Current/Headers/" unless x11?
     paths << "#{MacSystem.x11_prefix}/include" if x11?
@@ -194,7 +213,7 @@ class << ENV
 
   def determine_make_jobs
     if (j = ENV['HOMEBREW_MAKE_JOBS'].to_i) < 1
-      Hardware.processor_count
+      Hardware::CPU.cores
     else
       j
     end
@@ -215,8 +234,8 @@ class << ENV
     end
     # Fix issue with sed barfing on unicode characters on Mountain Lion
     s << 's' if MacOS.version >= :mountain_lion
-    # Fix issue with 10.8 apr-1-config having broken paths
-    s << 'a' if MacOS.version == :mountain_lion
+    # Fix issue with >= 10.8 apr-1-config having broken paths
+    s << 'a' if MacOS.version >= :mountain_lion
     s
   end
 
@@ -225,11 +244,6 @@ class << ENV
     # nothing is valid, it still fixes most usage to supply a valid path that
     # is not "/".
     MacOS::Xcode.prefix || ENV['DEVELOPER_DIR']
-  end
-
-  def brewed_python?
-    require 'formula'
-    Formula.factory('python').linked_keg.directory?
   end
 
   public
@@ -257,11 +271,11 @@ class << ENV
   alias_method :j1, :deparallelize
   def gcc
     ENV['CC'] = ENV['OBJC'] = ENV['HOMEBREW_CC'] = "gcc"
-    ENV['CXX'] = ENV['OBJCXX'] = "g++"
+    ENV['CXX'] = ENV['OBJCXX'] = "g++-4.2"
   end
   def llvm
     ENV['CC'] = ENV['OBJC'] = ENV['HOMEBREW_CC'] = "llvm-gcc"
-    ENV['CXX'] = ENV['OBJCXX'] = "g++"
+    ENV['CXX'] = ENV['OBJCXX'] = "llvm-g++-4.2"
   end
   def clang
     ENV['CC'] = ENV['OBJC'] = ENV['HOMEBREW_CC'] = "clang"
